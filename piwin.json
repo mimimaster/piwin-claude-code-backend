@@ -3,7 +3,6 @@
     "schemaVersion": 1,
     "id": "claude-code",
     "name": "Claude Code",
-    "description": "Local Claude Code session backend for piwin",
     "version": "0.1.0",
     "minHostVersion": "0.0.0",
     "protocol": "piwin-agent-stdio",
