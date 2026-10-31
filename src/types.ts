@@ -40,7 +40,9 @@ export type ClaudeQueryOptions = {
   canUseTool?: (toolName: string, input: unknown) => Promise<{ behavior: 'allow' | 'deny'; updatedInput?: unknown; message?: string }>;
 };
 
+export type ClaudeImagePart = { mimeType: string; data: string };
+
 export type ClaudeQueryPort = {
-  query(input: { prompt: string; options: ClaudeQueryOptions }): AsyncIterable<ClaudeSdkMessage>;
+  query(input: { prompt: string; images?: readonly ClaudeImagePart[]; options: ClaudeQueryOptions }): AsyncIterable<ClaudeSdkMessage>;
   interrupt?(): Promise<void>;
 };

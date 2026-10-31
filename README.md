@@ -1,12 +1,19 @@
 # piwin Claude Code backend
 
-Independent `sessionBackend` extension. It talks `piwin-agent-stdio` to a Host and drives a **user-owned** local `claude` executable.
+Independent `sessionBackend` extension. It talks `piwin-agent-stdio` to a Host and drives a **user-owned** local `claude` executable over its stream-json CLI.
+
+Install from the piwin Marketplace as an ordinary extension (`mimimaster/claude-code`).
+Enable it in Settings → Agent Backends. This adapter does **not** include the Claude
+CLI; install and log in to Claude Code on the Host yourself.
+
 
 ## Rules
 
-- Host supplies `runtime.binaryPath`. This plugin never ships or substitutes `@anthropic-ai/claude-agent-sdk-*` platform binaries.
-- Pinned SDK import (when present): `@anthropic-ai/claude-agent-sdk@0.3.282`. Tests use an injected query port.
-- Coding preset setting sources: `user`, `project`, `local`. Do not silently apply SDK-empty settings in production.
+- Production connection path is the user-owned CLI (`src/cli-query.ts`). This plugin does not import or spawn `@anthropic-ai/claude-agent-sdk` in production.
+- Host supplies `runtime.binaryPath`. Never substitute SDK platform binaries.
+- Tests inject a fake query port and must not download/spawn the SDK CLI.
+- Coding preset setting sources: `user`, `project`, `local`. Do not silently apply empty settings in production.
+- `session/new` does not persist a synthetic `cc-<host-id>` native id. Load/resume require the real vendor session id.
 - Artifact: `pnpm build` writes `dist/agent.mjs` and integrity-pins `piwin.json`.
 
 ## Verify

@@ -21,8 +21,8 @@
     "artifact": {
       "format": "node-esm",
       "entrypoint": "dist/agent.mjs",
-      "sha256": "f0b15cdb85b8b3fe2229d9d72ff99756a86b2d7914ace6d5314edb5b5423363e",
-      "byteSize": 26831
+      "sha256": "f9d68bda0c2f4dbbbcea35fea7f269db2d651f70e9790273b849e85c9dfd9c60",
+      "byteSize": 36197
     },
     "compatibleRevisions": [],
     "unversionedBindingCompatible": false,

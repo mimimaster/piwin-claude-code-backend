@@ -1,5 +1,7 @@
 import { claudeCapabilities, claudeOptions, DEFAULT_PERMISSION_OPTIONS } from './capabilities.js';
 import { claudeCliLaunch } from './cli-launch.js';
+import { defaultClaudeHistoryRoot, reconstructClaudeHistory } from './claude-history.js';
+import { claudeImagesFromAttachments } from './prompt-content.js';
 import { resolveClaudeBinary } from './binary.js';
 import { eventFrame, errFrame, okFrame, requestFrame } from './frames.js';
 import { mapClaudeMessage, type MapState } from './map-claude.js';
@@ -33,6 +35,9 @@ export type PluginDeps = {
   pathExists?: (path: string) => boolean;
   env?: NodeJS.ProcessEnv;
   settingsPreset?: ClaudeSettingsPreset;
+  historyRoot?: string;
+  readHistoryFile?: (path: string) => string | undefined;
+  readMediaFile?: (path: string) => Buffer | undefined;
 };
 
 export class ClaudePlugin {
@@ -70,9 +75,11 @@ export class ClaudePlugin {
       case 'catalog/usage':
         this.deps.io.write(okFrame(frame, []));
         return;
+      case 'catalog/native-observe':
+        return this.nativeObserve(frame);
       case 'catalog/rename':
       case 'catalog/delete':
-        this.deps.io.write(okFrame(frame, null));
+        this.deps.io.write(errFrame(frame, 'unsupported', `${frame.method} is not implemented`));
         return;
       case 'session/new':
       case 'session/load':
@@ -116,7 +123,7 @@ export class ClaudePlugin {
       nativeCliLaunch: caps?.nativeCliLaunch === true,
       nativeUserInput: caps?.nativeUserInput === true,
     };
-    this.deps.io.write(okFrame(frame, { agentId: AGENT_ID, protocolVersion: 1, sdk: PINNED_CLAUDE_AGENT_SDK }));
+    this.deps.io.write(okFrame(frame, { agentId: AGENT_ID, protocolVersion: 1, sdk: PINNED_CLAUDE_AGENT_SDK, nativeObservation: true }));
   }
 
   private check(frame: Extract<Frame, { kind: 'request' }>): void {
@@ -158,24 +165,35 @@ export class ClaudePlugin {
     const cwd = typeof params?.cwd === 'string' ? params.cwd : '';
     const binding = asRecord(params?.binding);
     const storedId = typeof binding?.backendSessionId === 'string' ? binding.backendSessionId : undefined;
-    const backendSessionId = frame.method === 'session/new' ? `cc-${frame.scope.sessionId}` : (storedId ?? `cc-${frame.scope.sessionId}`);
-    if ((frame.method === 'session/load' || frame.method === 'session/resume') && storedId !== undefined && storedId !== backendSessionId) {
-      this.deps.io.write(errFrame(frame, 'invalid-request', 'native session id mismatch'));
-      return;
+    const syntheticId = `cc-${frame.scope.sessionId}`;
+    const unboundDraft = storedId === undefined || storedId.length === 0 || storedId === syntheticId;
+    if (frame.method === 'session/load' || frame.method === 'session/resume') {
+      if (unboundDraft) {
+        this.deps.io.write(errFrame(frame, 'invalid-request', 'native session id required'));
+        return;
+      }
     }
+    const backendSessionId = frame.method === 'session/new' ? '' : storedId ?? '';
     const existing = this.sessions.get(frame.scope.sessionId);
     const reuse = frame.method !== 'session/new' && existing !== undefined
-      && (storedId === undefined || storedId === existing.backendSessionId);
+      && storedId === existing.backendSessionId;
     const slot: SessionSlot = reuse && existing !== undefined ? existing : {
       cwd,
       backendSessionId,
-      // Load/resume of a Host-stored vendor id must resume on the first prompt.
-      // session/new stays unbound so CC-02 never sends a synthetic --resume.
-      nativeBound: frame.method !== 'session/new' && storedId !== undefined,
+      // session/new stays unbound until the CLI reports a real session_id.
+      nativeBound: frame.method !== 'session/new' && !unboundDraft,
       cancelled: false,
       ...emptySlotOptions(),
       replay: [],
     };
+    if (frame.method === 'session/load' && !reuse) {
+      const reconstructed = this.reconstructHistory(slot.cwd, slot.backendSessionId);
+      if (!reconstructed.ok) {
+        this.deps.io.write(errFrame(frame, 'unavailable', reconstructed.reason));
+        return;
+      }
+      slot.replay = reconstructed.events;
+    }
     if (!reuse) this.sessions.set(frame.scope.sessionId, slot);
     this.deps.io.write(okFrame(frame, {
       backendSessionId: slot.backendSessionId,
@@ -184,6 +202,35 @@ export class ClaudePlugin {
       options: claudeOptions(slot),
       replayEvents: frame.method === 'session/new' ? [] : slot.replay,
     }));
+  }
+
+  private nativeObserve(frame: Extract<Frame, { kind: 'request' }>): void {
+    const params = asRecord(frame.params);
+    const backendSessionId = typeof params?.backendSessionId === 'string' ? params.backendSessionId : '';
+    const workingDirectory = typeof params?.workingDirectory === 'string' ? params.workingDirectory : '';
+    if (backendSessionId.length === 0) {
+      this.deps.io.write(errFrame(frame, 'invalid-request', 'native session id required'));
+      return;
+    }
+    const live = [...this.sessions.values()].find((slot) => slot.backendSessionId === backendSessionId);
+    const reconstructed = this.reconstructHistory(workingDirectory, backendSessionId);
+    const activity = live?.promptFrame !== undefined ? 'running' : reconstructed.ok ? 'idle' : 'unknown';
+    this.deps.io.write(okFrame(frame, {
+      backendSessionId,
+      activity,
+      ...(params?.includeHistory === true && reconstructed.ok ? { replayEvents: reconstructed.events } : {}),
+    }));
+  }
+
+  private reconstructHistory(cwd: string, backendSessionId: string) {
+    const historyRoot = this.deps.historyRoot ?? defaultClaudeHistoryRoot(this.deps.env ?? process.env);
+    if (historyRoot === undefined) return { ok: false as const, reason: 'native history unavailable' };
+    return reconstructClaudeHistory({
+      historyRoot,
+      cwd,
+      sessionId: backendSessionId,
+      ...(this.deps.readHistoryFile === undefined ? {} : { readFile: this.deps.readHistoryFile }),
+    });
   }
 
   private async prompt(frame: Extract<Frame, { kind: 'request' }>): Promise<void> {
@@ -227,8 +274,17 @@ export class ClaudePlugin {
       return allow ? { behavior: 'allow' as const, updatedInput: toolInput } : { behavior: 'deny' as const, message: 'denied' };
     };
     try {
+      const images = claudeImagesFromAttachments(
+        input?.attachments,
+        this.deps.readMediaFile,
+      );
+      if (!images.ok) {
+        this.deps.io.write(errFrame(frame, 'invalid-request', images.reason));
+        return;
+      }
       for await (const message of this.deps.query.query({
         prompt: text,
+        ...(images.images.length > 0 ? { images: images.images } : {}),
         options: {
           cwd: slot.cwd,
           pathToClaudeCodeExecutable: binary.binaryPath,

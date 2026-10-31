@@ -29,18 +29,21 @@ export function createClaudeCliQueryPort(input: {
   env?: NodeJS.ProcessEnv;
 } = {}): ClaudeQueryPort {
   const spawnImpl = input.spawnImpl ?? spawn;
-  let child: ChildProcessWithoutNullStreams | undefined;
+  const children = new Set<ChildProcessWithoutNullStreams>();
   return {
-    async *query({ prompt, options }) {
+    async *query(request) {
+      const prompt = request.prompt;
+      const options = request.options;
       if (!isUserOwnedClaudeBinary(options.pathToClaudeCodeExecutable)) {
         throw new Error('refusing SDK platform binary');
       }
       const env = { ...(input.env ?? process.env) };
-      child = spawnImpl(options.pathToClaudeCodeExecutable, buildClaudeCliArgs(options), {
+      const child = spawnImpl(options.pathToClaudeCodeExecutable, buildClaudeCliArgs(options), {
         cwd: options.cwd,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
       }) as ChildProcessWithoutNullStreams;
+      children.add(child);
       child.stderr.resume();
       const lines = readLines(child);
       const initId = randomUUID();
@@ -49,7 +52,7 @@ export function createClaudeCliQueryPort(input: {
         type: 'user',
         uuid: randomUUID(),
         parent_tool_use_id: null,
-        message: { role: 'user', content: prompt },
+        message: { role: 'user', content: userContent(prompt, request.images) },
       });
       try {
         for await (const message of lines) {
@@ -77,13 +80,14 @@ export function createClaudeCliQueryPort(input: {
           if (message.type === 'result') break;
         }
       } finally {
+        children.delete(child);
         await closeChild(child);
-        child = undefined;
       }
     },
     async interrupt() {
-      if (child === undefined) return;
-      writeJson(child, { type: 'control_request', request_id: randomUUID(), request: { subtype: 'interrupt' } });
+      for (const live of [...children]) {
+        writeJson(live, { type: 'control_request', request_id: randomUUID(), request: { subtype: 'interrupt' } });
+      }
     },
   };
 }
@@ -129,4 +133,15 @@ function rec(value: unknown): Record<string, unknown> | undefined {
 
 function isSdkMessage(value: NativeLine): value is ClaudeSdkMessage {
   return value.type === 'system' || value.type === 'assistant' || value.type === 'stream_event' || value.type === 'user' || value.type === 'result';
+}
+
+function userContent(prompt: string, images: readonly { mimeType: string; data: string }[] | undefined): unknown {
+  const blocks: unknown[] = [{ type: 'text', text: prompt }];
+  for (const image of images ?? []) {
+    blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: image.mimeType, data: image.data },
+    });
+  }
+  return blocks;
 }

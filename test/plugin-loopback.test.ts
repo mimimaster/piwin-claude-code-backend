@@ -107,8 +107,8 @@ describe('claude plugin loopback (17-check equivalent)', () => {
     const opened = written.at(-1) as Extract<Frame, { kind: 'response'; ok: true }>;
     expect(opened.ok).toBe(true);
     const nativeId = (opened.result as { backendSessionId: string }).backendSessionId;
-    expect(nativeId.length).toBeGreaterThan(0);
-    checks.push('native session id');
+    expect(nativeId).toBe('');
+    checks.push('unbound draft has no native id');
 
     await plugin.handle(req('session/cancel', {}, sessionScope));
     expect(written.at(-1)).toMatchObject({ ok: true, result: null });
@@ -162,7 +162,7 @@ describe('claude plugin loopback (17-check equivalent)', () => {
     expect(checks).toEqual([
       'initialize catalogs',
       'initialize sends no inference',
-      'native session id',
+      'unbound draft has no native id',
       'idle interrupt receipt',
       'real partial text deltas',
       'deny real approval request',
