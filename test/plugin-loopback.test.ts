@@ -95,11 +95,25 @@ describe('claude plugin loopback (17-check equivalent)', () => {
       hostCapabilities: { nativeCliLaunch: true, nativeUserInput: true },
     }));
     const init = written.at(-1);
-    expect(init).toMatchObject({ ok: true, result: { agentId: 'claude-code', protocolVersion: 1 } });
+    expect(init).toMatchObject({
+      ok: true,
+      result: { agentId: 'claude-code', protocolVersion: 1, requestUsage: true, nativeObservation: true },
+    });
     checks.push('initialize catalogs');
 
     await plugin.handle(req('check', { refresh: true }));
-    expect(written.at(-1)).toMatchObject({ result: { state: 'ready', binaryPath: '/opt/claude', nativeCli: { supported: true } } });
+    expect(written.at(-1)).toMatchObject({
+      result: {
+        state: 'ready',
+        binaryPath: '/opt/claude',
+        nativeCli: { supported: true },
+        options: {
+          models: expect.arrayContaining([
+            expect.objectContaining({ id: 'haiku', contextTokens: 200_000 }),
+          ]),
+        },
+      },
+    });
     expect(inference).toEqual([]);
     checks.push('initialize sends no inference');
 

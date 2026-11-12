@@ -5,12 +5,18 @@
  * Host needs a catalog before any `claude` process exists. These are the
  * CLI's own `--model` aliases; the native CLI resolves them to concrete ids.
  */
-export type ClaudeModelOption = { id: string; label: string };
+export type ClaudeModelOption = { id: string; label: string; contextTokens?: number };
+
+export const DEFAULT_CLAUDE_CONTEXT_TOKENS = 200_000;
+
+export function inferClaudeContextTokens(modelId: string): number {
+  return /\b1m\b|\[1m\]|-1m\b/i.test(modelId) ? 1_000_000 : DEFAULT_CLAUDE_CONTEXT_TOKENS;
+}
 
 export const CLAUDE_MODEL_ALIASES: readonly ClaudeModelOption[] = [
-  { id: 'haiku', label: 'Haiku' },
-  { id: 'sonnet', label: 'Sonnet' },
-  { id: 'opus', label: 'Opus' },
+  { id: 'haiku', label: 'Haiku', contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS },
+  { id: 'sonnet', label: 'Sonnet', contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS },
+  { id: 'opus', label: 'Opus', contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS },
 ];
 
 /** Cheapest alias first: a new session should not spend premium quota by default. */

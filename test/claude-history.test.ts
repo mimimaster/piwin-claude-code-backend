@@ -2,7 +2,11 @@ import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { encodeClaudeProjectDir, reconstructClaudeHistory } from '../src/claude-history.js';
+import {
+  encodeClaudeProjectDir,
+  readClaudeSessionRequestUsage,
+  reconstructClaudeHistory,
+} from '../src/claude-history.js';
 
 const jsonl = [
   JSON.stringify({ type: 'queue-operation', operation: 'enqueue' }),
@@ -13,8 +17,31 @@ const jsonl = [
   }),
   JSON.stringify({
     type: 'assistant',
+    uuid: 'a1-partial',
+    timestamp: '2026-11-12T03:00:00.000Z',
+    message: {
+      id: 'msg_a1',
+      model: 'claude-sonnet-4-5',
+      usage: { input_tokens: 4, cache_read_input_tokens: 500, cache_creation_input_tokens: 100, output_tokens: 10 },
+      content: [{ type: 'text', text: 'partial' }],
+    },
+  }),
+  JSON.stringify({
+    type: 'assistant',
     uuid: 'a1',
-    message: { id: 'msg_a1', content: [{ type: 'text', text: 'prior assistant' }] },
+    timestamp: '2026-11-12T03:00:02.000Z',
+    message: {
+      id: 'msg_a1',
+      model: 'claude-sonnet-4-5',
+      usage: {
+        input_tokens: 4,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 100,
+        output_tokens: 55,
+        output_tokens_details: { thinking_tokens: 15 },
+      },
+      content: [{ type: 'text', text: 'prior assistant' }],
+    },
   }),
   JSON.stringify({
     type: 'user',
@@ -50,6 +77,30 @@ describe('claude native history reconstruction', () => {
     expect(text).toContain('prior assistant');
     expect(text).not.toContain('Request interrupted');
     expect(result.events.some((emission) => emission.event.type === 'message/start' && emission.event.role === 'user')).toBe(true);
+  });
+
+  it('extracts deduplicated per-request token usage from native session jsonl', () => {
+    const files = new Map<string, string>([['/hist/projects/-work/native-cc-saved.jsonl', jsonl]]);
+    const usage = readClaudeSessionRequestUsage({
+      historyRoot: '/hist',
+      cwd: '/work',
+      sessionId: 'native-cc-saved',
+      readFile: (path) => files.get(path),
+    });
+    expect(usage).toEqual([
+      {
+        requestId: 'msg_a1',
+        backendSessionId: 'native-cc-saved',
+        modelId: 'claude-sonnet-4-5',
+        promptTokens: 4,
+        cacheReadTokens: 500,
+        cacheWriteTokens: 100,
+        completionTokens: 55,
+        reasoningTokens: 15,
+        totalTokens: 659,
+        recordedAt: '2026-11-12T03:00:02.000Z',
+      },
+    ]);
   });
 
   it('fails closed when the jsonl is missing', () => {

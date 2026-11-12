@@ -24,7 +24,8 @@ const declaration = {
   id: 'claude-code',
   name: 'Claude Code',
   description: 'Local Claude Code session backend for piwin',
-  version: '0.1.0',
+  icon: { kind: 'brand', id: 'claude' },
+  version: '0.1.1',
   minHostVersion: '0.0.0',
   protocol: 'piwin-agent-stdio',
   protocolVersion: 1,
@@ -34,7 +35,7 @@ const declaration = {
   helpUrl: 'https://code.claude.com/docs/en/agent-sdk/typescript',
   artifact: { format: 'node-esm', entrypoint: 'dist/agent.mjs', sha256, byteSize: bytes.byteLength },
   compatibleRevisions: [],
-  unversionedBindingCompatible: false,
+  unversionedBindingCompatible: true,
   outputDirectories: [
     { id: 'images', base: 'working-directory', relativePath: '.piwin-claude-code/images', kind: 'image' },
   ],

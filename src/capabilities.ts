@@ -37,14 +37,20 @@ export function claudeCapabilities() {
 }
 
 export function claudeOptions(input: {
-  models?: readonly { id: string; label: string }[];
+  models?: readonly { id: string; label: string; contextTokens?: number }[];
   commands?: readonly { name: string; description?: string }[];
   currentModelId?: string;
   currentModeId?: string;
 }) {
   return {
     agentId: AGENT_ID,
-    models: input.models ?? [],
+    models: (input.models ?? []).map((model) => ({
+      id: model.id,
+      label: model.label,
+      ...(typeof model.contextTokens === 'number' && Number.isFinite(model.contextTokens) && model.contextTokens > 0
+        ? { contextTokens: model.contextTokens }
+        : {}),
+    })),
     ...(input.currentModelId === undefined ? {} : { currentModelId: input.currentModelId }),
     modes: [
       { id: 'default', label: 'Default' },

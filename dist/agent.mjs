@@ -44,7 +44,11 @@ function claudeCapabilities() {
 function claudeOptions(input) {
   return {
     agentId: AGENT_ID,
-    models: input.models ?? [],
+    models: (input.models ?? []).map((model) => ({
+      id: model.id,
+      label: model.label,
+      ...typeof model.contextTokens === "number" && Number.isFinite(model.contextTokens) && model.contextTokens > 0 ? { contextTokens: model.contextTokens } : {}
+    })),
     ...input.currentModelId === void 0 ? {} : { currentModelId: input.currentModelId },
     modes: [
       { id: "default", label: "Default" },
@@ -78,6 +82,198 @@ function claudeCliLaunch(input) {
 // src/claude-history.ts
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+
+// src/map-claude.ts
+function parseClaudeRawUsage(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return void 0;
+  const usage = raw;
+  const promptTokens = nonNegativeInt(usage.input_tokens);
+  const cacheReadTokens = nonNegativeInt(usage.cache_read_input_tokens);
+  const cacheWriteTokens = nonNegativeInt(usage.cache_creation_input_tokens);
+  const completionTokens = nonNegativeInt(usage.output_tokens);
+  const reasoningTokens = nonNegativeIntOptional(usage.output_tokens_details?.thinking_tokens);
+  const totalTokens = promptTokens + cacheReadTokens + cacheWriteTokens + completionTokens;
+  if (totalTokens <= 0) return void 0;
+  return {
+    promptTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    completionTokens,
+    ...reasoningTokens !== void 0 && reasoningTokens > 0 ? { reasoningTokens } : {},
+    totalTokens
+  };
+}
+function textFromContent(content) {
+  const parts = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec2 = block;
+    if (rec2.type === "text" && typeof rec2.text === "string") parts.push(rec2.text);
+  }
+  return parts.join("");
+}
+function mapClaudeMessage(state, message) {
+  const runId = state.runId;
+  if (message.type === "system" && message.subtype === "init") {
+    state.sessionId = message.session_id;
+    return [{ type: "session/started", sessionId: message.session_id }];
+  }
+  if (message.type === "stream_event" && message.event.type === "content_block_delta" && message.event.delta?.type === "text_delta" && typeof message.event.delta.text === "string") {
+    state.streamed = true;
+    if (state.messageId === void 0) {
+      state.messageId = `cc-${state.sessionId}-assistant`;
+      state.started = true;
+      return [
+        { type: "message/start", messageId: state.messageId, role: "assistant", ...runId === void 0 ? {} : { runId } },
+        { type: "message/text_delta", messageId: state.messageId, delta: message.event.delta.text, ...runId === void 0 ? {} : { runId } }
+      ];
+    }
+    return [{ type: "message/text_delta", messageId: state.messageId, delta: message.event.delta.text, ...runId === void 0 ? {} : { runId } }];
+  }
+  if (message.type === "assistant") {
+    const backendMessageId = nonEmptyString(message.message.id) ?? nonEmptyString(message.uuid);
+    const text = textFromContent(message.message.content);
+    const events = [];
+    if (state.messageId === void 0) {
+      state.messageId = backendMessageId ?? `cc-${state.sessionId}-assistant`;
+      state.started = true;
+      events.push({ type: "message/start", messageId: state.messageId, role: "assistant", ...backendMessageId === void 0 ? {} : { backendMessageId }, ...runId === void 0 ? {} : { runId } });
+    }
+    const parsedUsage = parseClaudeRawUsage(message.message.usage);
+    if (parsedUsage !== void 0) {
+      state.assistantCalls ??= /* @__PURE__ */ new Map();
+      const callKey = backendMessageId ?? `${state.sessionId}-call-${state.assistantCalls.size + 1}`;
+      const modelId = nonEmptyString(message.message.model);
+      state.assistantCalls.set(callKey, {
+        requestId: callKey,
+        ...modelId === void 0 ? {} : { modelId },
+        ...parsedUsage
+      });
+    }
+    const alreadyStreamed = state.streamed === true;
+    state.streamed = false;
+    if (text.length > 0 && !alreadyStreamed) {
+      events.push({ type: "message/text_delta", messageId: state.messageId, delta: text, ...runId === void 0 ? {} : { runId } });
+    }
+    for (const block of message.message.content) {
+      if (typeof block !== "object" || block === null) continue;
+      const rec2 = block;
+      if (rec2.type === "tool_use" && typeof rec2.id === "string" && typeof rec2.name === "string") {
+        events.push({ type: "tool/start", toolCallId: rec2.id, toolName: rec2.name, ...runId === void 0 ? {} : { runId } });
+      }
+    }
+    return events;
+  }
+  if (message.type === "user") {
+    return toolResults(message.message?.content).map((result) => ({
+      type: "tool/end",
+      toolCallId: result.toolUseId,
+      isError: result.isError,
+      ...runId === void 0 ? {} : { runId }
+    }));
+  }
+  if (message.type === "result") {
+    const events = [];
+    if (state.messageId !== void 0) {
+      events.push({ type: "message/end", messageId: state.messageId, ...runId === void 0 ? {} : { runId } });
+    }
+    for (const measurement of buildTurnMeasurements(state, message)) {
+      events.push({ type: "usage/finalized", measurement });
+    }
+    return events;
+  }
+  return [];
+}
+function buildTurnMeasurements(state, result) {
+  const hostSessionId = nonEmptyString(state.hostSessionId) ?? nonEmptyString(state.sessionId);
+  if (hostSessionId === void 0) return [];
+  const recordedAt = (state.now ?? (() => (/* @__PURE__ */ new Date()).toISOString()))();
+  const modelUsageIds = result.modelUsage ? Object.keys(result.modelUsage).filter((key) => key.length > 0) : [];
+  const fallbackModelId = modelUsageIds[0] ?? nonEmptyString(state.modelId);
+  const totalCostUsd = finiteNonNegative(result.total_cost_usd);
+  const calls = state.assistantCalls ? [...state.assistantCalls.values()] : [];
+  if (calls.length > 0) {
+    const sumTokens = calls.reduce((acc, item) => acc + item.totalTokens, 0);
+    return calls.map((call, index) => {
+      const isLast = index === calls.length - 1;
+      const messageId = isLast && state.messageId !== void 0 ? state.messageId : call.requestId;
+      const resolvedModelId = call.modelId ?? fallbackModelId;
+      const modelCost = resolvedModelId !== void 0 ? finiteNonNegative(result.modelUsage?.[resolvedModelId]?.costUSD) : void 0;
+      const callCostUsd = totalCostUsd !== void 0 && sumTokens > 0 ? totalCostUsd * (call.totalTokens / sumTokens) : calls.length === 1 ? modelCost : void 0;
+      return toMeasurement({
+        requestId: call.requestId,
+        sessionId: hostSessionId,
+        messageId,
+        recordedAt,
+        usage: call,
+        ...resolvedModelId === void 0 ? {} : { modelId: resolvedModelId },
+        ...state.runId === void 0 || state.runId.length === 0 ? {} : { runId: state.runId },
+        ...state.runtimeGenerationId === void 0 || state.runtimeGenerationId.length === 0 ? {} : { runtimeGenerationId: state.runtimeGenerationId },
+        ...callCostUsd === void 0 ? {} : { costUsd: callCostUsd }
+      });
+    });
+  }
+  const parsedResult = parseClaudeRawUsage(result.usage);
+  if (parsedResult === void 0) return [];
+  const fallbackId = state.messageId ?? (state.runId !== void 0 && state.runId.length > 0 ? `${hostSessionId}-${state.runId}` : `${hostSessionId}-result`);
+  return [
+    toMeasurement({
+      requestId: fallbackId,
+      sessionId: hostSessionId,
+      messageId: state.messageId ?? fallbackId,
+      recordedAt,
+      usage: parsedResult,
+      ...fallbackModelId === void 0 ? {} : { modelId: fallbackModelId },
+      ...state.runId === void 0 || state.runId.length === 0 ? {} : { runId: state.runId },
+      ...state.runtimeGenerationId === void 0 || state.runtimeGenerationId.length === 0 ? {} : { runtimeGenerationId: state.runtimeGenerationId },
+      ...totalCostUsd === void 0 ? {} : { costUsd: totalCostUsd }
+    })
+  ];
+}
+function toMeasurement(input) {
+  return {
+    measurementId: `${AGENT_ID}:${input.requestId}`,
+    sessionId: input.sessionId,
+    messageId: input.messageId,
+    promptTokens: input.usage.promptTokens,
+    completionTokens: input.usage.completionTokens,
+    cacheReadTokens: input.usage.cacheReadTokens,
+    cacheWriteTokens: input.usage.cacheWriteTokens,
+    ...input.usage.reasoningTokens === void 0 ? {} : { reasoningTokens: input.usage.reasoningTokens },
+    totalTokens: input.usage.totalTokens,
+    recordedAt: input.recordedAt,
+    ...input.modelId === void 0 ? {} : { modelId: input.modelId },
+    ...input.runId === void 0 ? {} : { runId: input.runId },
+    ...input.runtimeGenerationId === void 0 ? {} : { runtimeGenerationId: input.runtimeGenerationId },
+    ...input.costUsd === void 0 ? {} : { costUsd: input.costUsd }
+  };
+}
+function toolResults(content) {
+  if (!Array.isArray(content)) return [];
+  const results = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const rec2 = block;
+    if (rec2.type === "tool_result" && typeof rec2.tool_use_id === "string") {
+      results.push({ toolUseId: rec2.tool_use_id, isError: rec2.is_error === true });
+    }
+  }
+  return results;
+}
+function nonEmptyString(value) {
+  return typeof value === "string" && value.length > 0 ? value : void 0;
+}
+function nonNegativeInt(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
+}
+function nonNegativeIntOptional(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : void 0;
+}
+function finiteNonNegative(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : void 0;
+}
+
+// src/claude-history.ts
 var MAX_LINE_CHARS = 256 * 1024;
 var MAX_EVENTS = 2e3;
 var SKIP_USER_TEXT = /* @__PURE__ */ new Set(["[Request interrupted by user]"]);
@@ -122,6 +318,53 @@ function reconstructClaudeHistory(input) {
   }
   if (events.length === 0) return { ok: false, reason: "native history unavailable" };
   return { ok: true, events: events.slice(0, MAX_EVENTS) };
+}
+function readClaudeSessionRequestUsage(input) {
+  if (input.sessionId.length === 0 || input.cwd.length === 0) return [];
+  const path = claudeSessionJsonlPath(input);
+  const body = (input.readFile ?? readUtf8)(path);
+  if (body === void 0) return [];
+  const fromMs = input.from !== void 0 ? Date.parse(input.from) : Number.NaN;
+  const byRequestId = /* @__PURE__ */ new Map();
+  let rowIndex = 0;
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0 || line.length > MAX_LINE_CHARS) continue;
+    let record;
+    try {
+      const parsed = JSON.parse(line);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+      record = parsed;
+    } catch {
+      continue;
+    }
+    if (record.type !== "assistant") continue;
+    const message = asRecord(record.message);
+    const usage = parseClaudeRawUsage(message?.usage);
+    if (usage === void 0) continue;
+    rowIndex += 1;
+    const requestId = stringId(message?.id) ?? stringId(record.requestId) ?? stringId(record.uuid) ?? `${input.sessionId}-req-${rowIndex}`;
+    const timestamp = stringId(record.timestamp);
+    if (timestamp === void 0 || !Number.isFinite(Date.parse(timestamp))) continue;
+    const modelId = stringId(message?.model) ?? stringId(input.fallbackModelId);
+    const costUsd = typeof record.costUSD === "number" && Number.isFinite(record.costUSD) && record.costUSD >= 0 ? record.costUSD : void 0;
+    byRequestId.set(requestId, {
+      requestId,
+      backendSessionId: input.sessionId,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      ...usage.reasoningTokens === void 0 ? {} : { reasoningTokens: usage.reasoningTokens },
+      totalTokens: usage.totalTokens,
+      recordedAt: new Date(timestamp).toISOString(),
+      ...modelId === void 0 ? {} : { modelId },
+      ...costUsd === void 0 ? {} : { costUsd }
+    });
+  }
+  const items = [...byRequestId.values()];
+  if (!Number.isFinite(fromMs)) return items;
+  return items.filter((item) => Date.parse(item.recordedAt) >= fromMs);
 }
 function readUtf8(path) {
   try {
@@ -318,87 +561,6 @@ function eventFrame(scope, emission) {
   return { protocolVersion: PROTOCOL_VERSION, kind: "event", scope, emission };
 }
 
-// src/map-claude.ts
-function textFromContent(content) {
-  const parts = [];
-  for (const block of content) {
-    if (typeof block !== "object" || block === null) continue;
-    const rec2 = block;
-    if (rec2.type === "text" && typeof rec2.text === "string") parts.push(rec2.text);
-  }
-  return parts.join("");
-}
-function mapClaudeMessage(state, message) {
-  const runId = state.runId;
-  if (message.type === "system" && message.subtype === "init") {
-    state.sessionId = message.session_id;
-    return [{ type: "session/started", sessionId: message.session_id }];
-  }
-  if (message.type === "stream_event" && message.event.type === "content_block_delta" && message.event.delta?.type === "text_delta" && typeof message.event.delta.text === "string") {
-    state.streamed = true;
-    if (state.messageId === void 0) {
-      state.messageId = `cc-${state.sessionId}-assistant`;
-      state.started = true;
-      return [
-        { type: "message/start", messageId: state.messageId, role: "assistant", ...runId === void 0 ? {} : { runId } },
-        { type: "message/text_delta", messageId: state.messageId, delta: message.event.delta.text, ...runId === void 0 ? {} : { runId } }
-      ];
-    }
-    return [{ type: "message/text_delta", messageId: state.messageId, delta: message.event.delta.text, ...runId === void 0 ? {} : { runId } }];
-  }
-  if (message.type === "assistant") {
-    const backendMessageId = typeof message.message.id === "string" ? message.message.id : message.uuid;
-    const text = textFromContent(message.message.content);
-    const events = [];
-    if (state.messageId === void 0) {
-      state.messageId = backendMessageId ?? `cc-${state.sessionId}-assistant`;
-      state.started = true;
-      events.push({ type: "message/start", messageId: state.messageId, role: "assistant", ...backendMessageId === void 0 ? {} : { backendMessageId }, ...runId === void 0 ? {} : { runId } });
-    }
-    const alreadyStreamed = state.streamed === true;
-    state.streamed = false;
-    if (text.length > 0 && !alreadyStreamed) {
-      events.push({ type: "message/text_delta", messageId: state.messageId, delta: text, ...runId === void 0 ? {} : { runId } });
-    }
-    for (const block of message.message.content) {
-      if (typeof block !== "object" || block === null) continue;
-      const rec2 = block;
-      if (rec2.type === "tool_use" && typeof rec2.id === "string" && typeof rec2.name === "string") {
-        events.push({ type: "tool/start", toolCallId: rec2.id, toolName: rec2.name, ...runId === void 0 ? {} : { runId } });
-      }
-    }
-    return events;
-  }
-  if (message.type === "user") {
-    return toolResults(message.message?.content).map((result) => ({
-      type: "tool/end",
-      toolCallId: result.toolUseId,
-      isError: result.isError,
-      ...runId === void 0 ? {} : { runId }
-    }));
-  }
-  if (message.type === "result") {
-    const events = [];
-    if (state.messageId !== void 0) {
-      events.push({ type: "message/end", messageId: state.messageId, ...runId === void 0 ? {} : { runId } });
-    }
-    return events;
-  }
-  return [];
-}
-function toolResults(content) {
-  if (!Array.isArray(content)) return [];
-  const results = [];
-  for (const block of content) {
-    if (typeof block !== "object" || block === null) continue;
-    const rec2 = block;
-    if (rec2.type === "tool_result" && typeof rec2.tool_use_id === "string") {
-      results.push({ toolUseId: rec2.tool_use_id, isError: rec2.is_error === true });
-    }
-  }
-  return results;
-}
-
 // src/prompt-outcome.ts
 var FAILURE_MESSAGE_MAX_CHARS = 500;
 var AUTH_FAILURE = /authenticat|oauth|\blog ?in\b|api key/i;
@@ -420,10 +582,14 @@ function failed(origin, code, message, retriable) {
 }
 
 // src/models.ts
+var DEFAULT_CLAUDE_CONTEXT_TOKENS = 2e5;
+function inferClaudeContextTokens(modelId) {
+  return /\b1m\b|\[1m\]|-1m\b/i.test(modelId) ? 1e6 : DEFAULT_CLAUDE_CONTEXT_TOKENS;
+}
 var CLAUDE_MODEL_ALIASES = [
-  { id: "haiku", label: "Haiku" },
-  { id: "sonnet", label: "Sonnet" },
-  { id: "opus", label: "Opus" }
+  { id: "haiku", label: "Haiku", contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS },
+  { id: "sonnet", label: "Sonnet", contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS },
+  { id: "opus", label: "Opus", contextTokens: DEFAULT_CLAUDE_CONTEXT_TOKENS }
 ];
 var DEFAULT_CLAUDE_MODEL_ID = "haiku";
 function isKnownModel(models, modelId) {
@@ -442,7 +608,6 @@ var ClaudePlugin = class {
   sessions = /* @__PURE__ */ new Map();
   hostBinaryPath;
   hostCapabilities = {};
-  callbackSeq = 0;
   constructor(deps) {
     this.deps = deps;
   }
@@ -467,8 +632,7 @@ var ClaudePlugin = class {
         this.deps.io.write(okFrame(frame, []));
         return;
       case "catalog/usage":
-        this.deps.io.write(okFrame(frame, []));
-        return;
+        return this.catalogUsage(frame);
       case "catalog/native-observe":
         return this.nativeObserve(frame);
       case "catalog/rename":
@@ -516,7 +680,40 @@ var ClaudePlugin = class {
       nativeCliLaunch: caps?.nativeCliLaunch === true,
       nativeUserInput: caps?.nativeUserInput === true
     };
-    this.deps.io.write(okFrame(frame, { agentId: AGENT_ID, protocolVersion: 1, sdk: PINNED_CLAUDE_AGENT_SDK, nativeObservation: true }));
+    this.deps.io.write(okFrame(frame, {
+      agentId: AGENT_ID,
+      protocolVersion: 1,
+      sdk: PINNED_CLAUDE_AGENT_SDK,
+      requestUsage: true,
+      nativeObservation: true
+    }));
+  }
+  catalogUsage(frame) {
+    const historyRoot = this.deps.historyRoot ?? defaultClaudeHistoryRoot(this.deps.env ?? process.env);
+    if (historyRoot === void 0) {
+      this.deps.io.write(okFrame(frame, []));
+      return;
+    }
+    const params = asRecord2(frame.params);
+    const from = typeof params?.from === "string" ? params.from : void 0;
+    const rawSessions = Array.isArray(params?.sessions) ? params.sessions : [];
+    const results = [];
+    for (const item of rawSessions) {
+      const entry = asRecord2(item);
+      const backendSessionId = typeof entry?.backendSessionId === "string" ? entry.backendSessionId : "";
+      const workingDirectory = typeof entry?.workingDirectory === "string" ? entry.workingDirectory : "";
+      const fallbackModelId = typeof entry?.modelId === "string" ? entry.modelId : void 0;
+      if (backendSessionId.length === 0 || workingDirectory.length === 0) continue;
+      results.push(...readClaudeSessionRequestUsage({
+        historyRoot,
+        cwd: workingDirectory,
+        sessionId: backendSessionId,
+        ...from === void 0 ? {} : { from },
+        ...fallbackModelId === void 0 ? {} : { fallbackModelId },
+        ...this.deps.readHistoryFile === void 0 ? {} : { readFile: this.deps.readHistoryFile }
+      }));
+    }
+    this.deps.io.write(okFrame(frame, results));
   }
   check(frame) {
     const resolved = resolveClaudeBinary({
@@ -556,6 +753,7 @@ var ClaudePlugin = class {
     const cwd = typeof params?.cwd === "string" ? params.cwd : "";
     const binding = asRecord2(params?.binding);
     const storedId = typeof binding?.backendSessionId === "string" ? binding.backendSessionId : void 0;
+    const bindingModelId = typeof binding?.modelId === "string" && binding.modelId.length > 0 ? binding.modelId : void 0;
     const syntheticId = `cc-${frame.scope.sessionId}`;
     const unboundDraft = storedId === void 0 || storedId.length === 0 || storedId === syntheticId;
     if (frame.method === "session/load" || frame.method === "session/resume") {
@@ -567,13 +765,24 @@ var ClaudePlugin = class {
     const backendSessionId = frame.method === "session/new" ? "" : storedId ?? "";
     const existing = this.sessions.get(frame.scope.sessionId);
     const reuse = frame.method !== "session/new" && existing !== void 0 && storedId === existing.backendSessionId;
+    const defaults = emptySlotOptions();
+    if (bindingModelId !== void 0) {
+      if (!isKnownModel(defaults.models, bindingModelId)) {
+        defaults.models.push({
+          id: bindingModelId,
+          label: bindingModelId,
+          contextTokens: inferClaudeContextTokens(bindingModelId)
+        });
+      }
+      defaults.currentModelId = bindingModelId;
+    }
     const slot = reuse && existing !== void 0 ? existing : {
       cwd,
       backendSessionId,
       // session/new stays unbound until the CLI reports a real session_id.
       nativeBound: frame.method !== "session/new" && !unboundDraft,
       cancelled: false,
-      ...emptySlotOptions(),
+      ...defaults,
       replay: []
     };
     if (frame.method === "session/load" && !reuse) {
@@ -647,7 +856,15 @@ var ClaudePlugin = class {
     slot.promptFrame = frame;
     const preset = this.deps.settingsPreset ?? "coding";
     const settingSources = resolveSettingSources(preset);
-    const mapState = { sessionId: slot.backendSessionId, runId, started: false };
+    const mapState = {
+      sessionId: slot.backendSessionId,
+      hostSessionId: frame.scope.sessionId,
+      runtimeGenerationId: frame.scope.runtimeGenerationId,
+      ...slot.currentModelId === void 0 ? {} : { modelId: slot.currentModelId },
+      ...this.deps.now === void 0 ? {} : { now: this.deps.now },
+      runId,
+      started: false
+    };
     let nativeResult;
     const canUseTool = async (toolName, toolInput) => {
       const decision = await this.deps.io.callHost(frame.scope, "permission/request", {
@@ -686,7 +903,11 @@ var ClaudePlugin = class {
           slot.backendSessionId = message.session_id;
           slot.nativeBound = true;
           slot.commands = [...message.commands ?? []];
-          const native = (message.models ?? []).map((model) => ({ id: model.id, label: model.display_name ?? model.id }));
+          const native = (message.models ?? []).map((model) => ({
+            id: model.id,
+            label: model.display_name ?? model.id,
+            contextTokens: inferClaudeContextTokens(model.id)
+          }));
           if (native.length > 0 && slot.currentModelId !== void 0 && isKnownModel(native, slot.currentModelId)) {
             slot.models = native;
           }
@@ -697,6 +918,9 @@ var ClaudePlugin = class {
             isError: message.is_error === true,
             ...typeof message.result === "string" ? { text: message.result } : {}
           };
+          if (applyModelContextWindows(slot, message.modelUsage)) {
+            this.deps.io.write(eventFrame(frame.scope, { type: "options", options: claudeOptions(slot) }));
+          }
         }
         for (const event of mapClaudeMessage(mapState, message)) {
           const emission = { type: "agent", event };
@@ -772,6 +996,30 @@ function createCallbackIo(write, waiters2) {
 }
 function emptySlotOptions() {
   return { models: [...CLAUDE_MODEL_ALIASES], commands: [], currentModelId: DEFAULT_CLAUDE_MODEL_ID };
+}
+function applyModelContextWindows(slot, modelUsage) {
+  if (!modelUsage) return false;
+  let changed = false;
+  for (const [modelId, info] of Object.entries(modelUsage)) {
+    const windowSize = info?.contextWindow;
+    if (typeof windowSize !== "number" || !Number.isFinite(windowSize) || windowSize <= 0) continue;
+    const match = slot.models.find((item) => item.id === modelId);
+    if (match !== void 0) {
+      if (match.contextTokens !== windowSize) {
+        match.contextTokens = windowSize;
+        changed = true;
+      }
+      continue;
+    }
+    if (slot.currentModelId !== void 0) {
+      const alias = slot.models.find((item) => item.id === slot.currentModelId);
+      if (alias !== void 0 && alias.contextTokens !== windowSize) {
+        alias.contextTokens = windowSize;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 function asRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;

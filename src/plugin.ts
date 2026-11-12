@@ -1,14 +1,20 @@
 import { claudeCapabilities, claudeOptions, DEFAULT_PERMISSION_OPTIONS } from './capabilities.js';
 import { claudeCliLaunch } from './cli-launch.js';
-import { defaultClaudeHistoryRoot, reconstructClaudeHistory } from './claude-history.js';
+import { defaultClaudeHistoryRoot, readClaudeSessionRequestUsage, reconstructClaudeHistory } from './claude-history.js';
 import { claudeImagesFromAttachments } from './prompt-content.js';
 import { resolveClaudeBinary } from './binary.js';
 import { eventFrame, errFrame, okFrame, requestFrame } from './frames.js';
 import { mapClaudeMessage, type MapState } from './map-claude.js';
 import { resolvePromptOutcome, type NativeResult } from './prompt-outcome.js';
-import { CLAUDE_MODEL_ALIASES, DEFAULT_CLAUDE_MODEL_ID, isKnownModel } from './models.js';
+import {
+  CLAUDE_MODEL_ALIASES,
+  DEFAULT_CLAUDE_MODEL_ID,
+  inferClaudeContextTokens,
+  isKnownModel,
+  type ClaudeModelOption,
+} from './models.js';
 import { resolveSettingSources, type ClaudeSettingsPreset } from './settings.js';
-import { AGENT_ID, PINNED_CLAUDE_AGENT_SDK, type ClaudeQueryPort, type Frame, type Scope } from './types.js';
+import { AGENT_ID, PINNED_CLAUDE_AGENT_SDK, type ClaudeQueryPort, type Frame, type RequestUsageRecord, type Scope } from './types.js';
 
 export type HostIO = {
   write(frame: Frame): void;
@@ -21,7 +27,7 @@ type SessionSlot = {
   nativeBound: boolean;
   cancelled: boolean;
   promptFrame?: Extract<Frame, { kind: 'request' }>;
-  models: { id: string; label: string }[];
+  models: ClaudeModelOption[];
   commands: { name: string; description?: string }[];
   currentModelId?: string;
   agentVersion?: string;
@@ -45,7 +51,6 @@ export class ClaudePlugin {
   private readonly sessions = new Map<string, SessionSlot>();
   private hostBinaryPath: string | undefined;
   private hostCapabilities: { nativeCliLaunch?: boolean; nativeUserInput?: boolean } = {};
-  private callbackSeq = 0;
 
   constructor(deps: PluginDeps) {
     this.deps = deps;
@@ -73,8 +78,7 @@ export class ClaudePlugin {
         this.deps.io.write(okFrame(frame, []));
         return;
       case 'catalog/usage':
-        this.deps.io.write(okFrame(frame, []));
-        return;
+        return this.catalogUsage(frame);
       case 'catalog/native-observe':
         return this.nativeObserve(frame);
       case 'catalog/rename':
@@ -123,7 +127,41 @@ export class ClaudePlugin {
       nativeCliLaunch: caps?.nativeCliLaunch === true,
       nativeUserInput: caps?.nativeUserInput === true,
     };
-    this.deps.io.write(okFrame(frame, { agentId: AGENT_ID, protocolVersion: 1, sdk: PINNED_CLAUDE_AGENT_SDK, nativeObservation: true }));
+    this.deps.io.write(okFrame(frame, {
+      agentId: AGENT_ID,
+      protocolVersion: 1,
+      sdk: PINNED_CLAUDE_AGENT_SDK,
+      requestUsage: true,
+      nativeObservation: true,
+    }));
+  }
+
+  private catalogUsage(frame: Extract<Frame, { kind: 'request' }>): void {
+    const historyRoot = this.deps.historyRoot ?? defaultClaudeHistoryRoot(this.deps.env ?? process.env);
+    if (historyRoot === undefined) {
+      this.deps.io.write(okFrame(frame, []));
+      return;
+    }
+    const params = asRecord(frame.params);
+    const from = typeof params?.from === 'string' ? params.from : undefined;
+    const rawSessions = Array.isArray(params?.sessions) ? params.sessions : [];
+    const results: RequestUsageRecord[] = [];
+    for (const item of rawSessions) {
+      const entry = asRecord(item);
+      const backendSessionId = typeof entry?.backendSessionId === 'string' ? entry.backendSessionId : '';
+      const workingDirectory = typeof entry?.workingDirectory === 'string' ? entry.workingDirectory : '';
+      const fallbackModelId = typeof entry?.modelId === 'string' ? entry.modelId : undefined;
+      if (backendSessionId.length === 0 || workingDirectory.length === 0) continue;
+      results.push(...readClaudeSessionRequestUsage({
+        historyRoot,
+        cwd: workingDirectory,
+        sessionId: backendSessionId,
+        ...(from === undefined ? {} : { from }),
+        ...(fallbackModelId === undefined ? {} : { fallbackModelId }),
+        ...(this.deps.readHistoryFile === undefined ? {} : { readFile: this.deps.readHistoryFile }),
+      }));
+    }
+    this.deps.io.write(okFrame(frame, results));
   }
 
   private check(frame: Extract<Frame, { kind: 'request' }>): void {
@@ -165,6 +203,7 @@ export class ClaudePlugin {
     const cwd = typeof params?.cwd === 'string' ? params.cwd : '';
     const binding = asRecord(params?.binding);
     const storedId = typeof binding?.backendSessionId === 'string' ? binding.backendSessionId : undefined;
+    const bindingModelId = typeof binding?.modelId === 'string' && binding.modelId.length > 0 ? binding.modelId : undefined;
     const syntheticId = `cc-${frame.scope.sessionId}`;
     const unboundDraft = storedId === undefined || storedId.length === 0 || storedId === syntheticId;
     if (frame.method === 'session/load' || frame.method === 'session/resume') {
@@ -177,13 +216,24 @@ export class ClaudePlugin {
     const existing = this.sessions.get(frame.scope.sessionId);
     const reuse = frame.method !== 'session/new' && existing !== undefined
       && storedId === existing.backendSessionId;
+    const defaults = emptySlotOptions();
+    if (bindingModelId !== undefined) {
+      if (!isKnownModel(defaults.models, bindingModelId)) {
+        defaults.models.push({
+          id: bindingModelId,
+          label: bindingModelId,
+          contextTokens: inferClaudeContextTokens(bindingModelId),
+        });
+      }
+      defaults.currentModelId = bindingModelId;
+    }
     const slot: SessionSlot = reuse && existing !== undefined ? existing : {
       cwd,
       backendSessionId,
       // session/new stays unbound until the CLI reports a real session_id.
       nativeBound: frame.method !== 'session/new' && !unboundDraft,
       cancelled: false,
-      ...emptySlotOptions(),
+      ...defaults,
       replay: [],
     };
     if (frame.method === 'session/load' && !reuse) {
@@ -260,7 +310,15 @@ export class ClaudePlugin {
     slot.promptFrame = frame;
     const preset = this.deps.settingsPreset ?? 'coding';
     const settingSources = resolveSettingSources(preset);
-    const mapState: MapState = { sessionId: slot.backendSessionId, runId, started: false };
+    const mapState: MapState = {
+      sessionId: slot.backendSessionId,
+      hostSessionId: frame.scope.sessionId,
+      runtimeGenerationId: frame.scope.runtimeGenerationId,
+      ...(slot.currentModelId === undefined ? {} : { modelId: slot.currentModelId }),
+      ...(this.deps.now === undefined ? {} : { now: this.deps.now }),
+      runId,
+      started: false,
+    };
     let nativeResult: NativeResult | undefined;
     const canUseTool = async (toolName: string, toolInput: unknown) => {
       const decision = await this.deps.io.callHost(frame.scope, 'permission/request', {
@@ -299,7 +357,11 @@ export class ClaudePlugin {
           slot.backendSessionId = message.session_id;
           slot.nativeBound = true;
           slot.commands = [...(message.commands ?? [])];
-          const native = (message.models ?? []).map((model) => ({ id: model.id, label: model.display_name ?? model.id }));
+          const native: ClaudeModelOption[] = (message.models ?? []).map((model) => ({
+            id: model.id,
+            label: model.display_name ?? model.id,
+            contextTokens: inferClaudeContextTokens(model.id),
+          }));
           // Keep the alias catalog unless the native list still contains the
           // selected model; otherwise the composer would lose its selection.
           if (native.length > 0 && slot.currentModelId !== undefined && isKnownModel(native, slot.currentModelId)) {
@@ -312,6 +374,9 @@ export class ClaudePlugin {
             isError: message.is_error === true,
             ...(typeof message.result === 'string' ? { text: message.result } : {}),
           };
+          if (applyModelContextWindows(slot, message.modelUsage)) {
+            this.deps.io.write(eventFrame(frame.scope, { type: 'options', options: claudeOptions(slot) }));
+          }
         }
         for (const event of mapClaudeMessage(mapState, message)) {
           const emission = { type: 'agent', event };
@@ -393,6 +458,35 @@ export function createCallbackIo(write: (frame: Frame) => void, waiters: Map<str
 
 function emptySlotOptions(): Pick<SessionSlot, 'models' | 'commands' | 'currentModelId'> {
   return { models: [...CLAUDE_MODEL_ALIASES], commands: [], currentModelId: DEFAULT_CLAUDE_MODEL_ID };
+}
+
+function applyModelContextWindows(
+  slot: SessionSlot,
+  modelUsage: Readonly<Record<string, { contextWindow?: number }>> | undefined,
+): boolean {
+  if (!modelUsage) return false;
+  let changed = false;
+  for (const [modelId, info] of Object.entries(modelUsage)) {
+    const windowSize = info?.contextWindow;
+    if (typeof windowSize !== 'number' || !Number.isFinite(windowSize) || windowSize <= 0) continue;
+    const match = slot.models.find((item) => item.id === modelId);
+    if (match !== undefined) {
+      if (match.contextTokens !== windowSize) {
+        match.contextTokens = windowSize;
+        changed = true;
+      }
+      continue;
+    }
+    // Alias catalog (`haiku` / `sonnet` / `opus`): update the active alias window when concrete usage arrives.
+    if (slot.currentModelId !== undefined) {
+      const alias = slot.models.find((item) => item.id === slot.currentModelId);
+      if (alias !== undefined && alias.contextTokens !== windowSize) {
+        alias.contextTokens = windowSize;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

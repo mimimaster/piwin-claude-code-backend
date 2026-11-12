@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AgentEvent } from './types.js';
+import { parseClaudeRawUsage } from './map-claude.js';
+import type { AgentEvent, RequestUsageRecord } from './types.js';
 
 export type HistoryEmission = { type: 'agent'; event: AgentEvent };
 
@@ -64,6 +65,75 @@ export function reconstructClaudeHistory(input: {
   }
   if (events.length === 0) return { ok: false, reason: 'native history unavailable' };
   return { ok: true, events: events.slice(0, MAX_EVENTS) };
+}
+
+/**
+ * Extract per-API-request token accounting from a native Claude session JSONL.
+ *
+ * Multiple JSONL rows can share one Anthropic `message.id` as content blocks
+ * flush; keeping the last occurrence per `requestId` avoids double-counting
+ * cached prompt tokens while preserving chronological request order.
+ */
+export function readClaudeSessionRequestUsage(input: {
+  historyRoot: string;
+  cwd: string;
+  sessionId: string;
+  from?: string;
+  fallbackModelId?: string;
+  readFile?: (path: string) => string | undefined;
+}): RequestUsageRecord[] {
+  if (input.sessionId.length === 0 || input.cwd.length === 0) return [];
+  const path = claudeSessionJsonlPath(input);
+  const body = (input.readFile ?? readUtf8)(path);
+  if (body === undefined) return [];
+  const fromMs = input.from !== undefined ? Date.parse(input.from) : Number.NaN;
+  const byRequestId = new Map<string, RequestUsageRecord>();
+  let rowIndex = 0;
+
+  for (const raw of body.split('\n')) {
+    const line = raw.trim();
+    if (line.length === 0 || line.length > MAX_LINE_CHARS) continue;
+    let record: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
+      record = parsed as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (record.type !== 'assistant') continue;
+    const message = asRecord(record.message);
+    const usage = parseClaudeRawUsage(message?.usage);
+    if (usage === undefined) continue;
+    rowIndex += 1;
+    const requestId = stringId(message?.id)
+      ?? stringId(record.requestId)
+      ?? stringId(record.uuid)
+      ?? `${input.sessionId}-req-${rowIndex}`;
+    const timestamp = stringId(record.timestamp);
+    if (timestamp === undefined || !Number.isFinite(Date.parse(timestamp))) continue;
+    const modelId = stringId(message?.model) ?? stringId(input.fallbackModelId);
+    const costUsd = typeof record.costUSD === 'number' && Number.isFinite(record.costUSD) && record.costUSD >= 0
+      ? record.costUSD
+      : undefined;
+    byRequestId.set(requestId, {
+      requestId,
+      backendSessionId: input.sessionId,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      ...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
+      totalTokens: usage.totalTokens,
+      recordedAt: new Date(timestamp).toISOString(),
+      ...(modelId === undefined ? {} : { modelId }),
+      ...(costUsd === undefined ? {} : { costUsd }),
+    });
+  }
+
+  const items = [...byRequestId.values()];
+  if (!Number.isFinite(fromMs)) return items;
+  return items.filter((item) => Date.parse(item.recordedAt) >= fromMs);
 }
 
 function readUtf8(path: string): string | undefined {

@@ -3,7 +3,12 @@
     "schemaVersion": 1,
     "id": "claude-code",
     "name": "Claude Code",
-    "version": "0.1.0",
+    "description": "Local Claude Code session backend for piwin",
+    "icon": {
+      "kind": "brand",
+      "id": "claude"
+    },
+    "version": "0.1.1",
     "minHostVersion": "0.0.0",
     "protocol": "piwin-agent-stdio",
     "protocolVersion": 1,
@@ -20,11 +25,11 @@
     "artifact": {
       "format": "node-esm",
       "entrypoint": "dist/agent.mjs",
-      "sha256": "f9d68bda0c2f4dbbbcea35fea7f269db2d651f70e9790273b849e85c9dfd9c60",
-      "byteSize": 36197
+      "sha256": "112c9d3613ea988d70ef03c563ec73beeef940c9e89eabaca1227ec4557bdec3",
+      "byteSize": 47647
     },
     "compatibleRevisions": [],
-    "unversionedBindingCompatible": false,
+    "unversionedBindingCompatible": true,
     "outputDirectories": [
       {
         "id": "images",
